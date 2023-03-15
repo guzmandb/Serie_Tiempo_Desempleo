@@ -1,0 +1,356 @@
+---
+title: 'Análisis de la series de tiempo del Desempleo usando el modelo SARIMA '
+author: 'Jherson Guzman Ramirez'
+date: "30/11/2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r include=FALSE}
+library(TSstudio)
+library(readxl)
+library(forecast)
+library(timetk)
+library(urca)
+library(zoo)
+library(tseries)
+library(tidyverse)
+library(lubridate)
+library(timetk)
+library(tsibble)
+library(xts)
+library(readxl)
+library(TSA)
+library(lmtest)
+library(fpp3)
+library(forecast)
+library(tseries)
+library(fpp3)
+require(timetk)
+library(fable)
+library(fabletools)
+library(fUnitRoots)
+setwd('~/Desktop')
+datos <- read_xlsx("tasa_desempleo.xlsx")
+
+```
+
+# Visualización de los datos
+
+Para la estimación del modelo vamos a usar el 90% de los datos, es decir, el conjunto de entrenamiento va desde enero del 2001, hasta diciembre del 2018. El conjunto de prueba va desde enero del 2019 hasta marzo del 2020.
+
+```{r}
+ts_desempleo<-ts(rev(datos$`Tasa de desempleo (%)`), start = c(2001,01), frequency = 12, end = c(2020,03))
+xts_desempleo = as.xts(ts_desempleo)
+plot(xts_desempleo, main = "Tasa de desempleo",xlab="Tiempo")
+```
+
+
+```{r echo=FALSE}
+ts_desempleo<-ts(rev(datos$`Tasa de desempleo (%)`), start = c(2001,01), frequency = 12, end = c(2018,12))
+xts_desempleo = as.xts(ts_desempleo)
+plot(xts_desempleo, main = "Tasa de desempleo - Entrenamiento",xlab="Tiempo")
+```
+
+En la gráfica de la Serie de tasa de desempleo, podemos ver ya algunos componentes notorios tales como tendencia y estacionalidad. Se puede ver un posible periodo de $S=12$ meses para la estacionalidad en donde los picos más altos parecen presentarse en los meses de principio de año y un notorio decaimiento para finales de año. En la tendencia podríamos pensar que estamos tratando con una tendencia de tipo estocástica, sin embargo, se realizaran las pruebas pertinentes para probar estadísticamente si se trata de ese tipo de tendencia. En cuanto a la varianza marginal, aunque parece constante a lo largo del tiempo, también se realizará un estudio correspondiente.
+
+```{r include=FALSE}
+
+acf(ts_desempleo,main="",sub="Figura 1: Función de Autocorrelación Simple", ci.type ="ma")
+pacf(ts_desempleo,main="",sub="Figura 1: Función de Autocorrelación Parcial")
+```
+
+# Estabilización de la varianza
+
+Para comenzar el análisis de la serie, vamos a seguir la metodología usada en clase, en donde se comenzará por realizar un análisis de la varianza marginal, esto lo haremos por medio del cálculo del $\lambda$ de las transformaciones Box-Cox.
+
+Al hacer el cálculo del $\lambda$ por medio del método de guerrero encontramos que el valor obtenido es $\lambda=0.5996448$, esto quiere decir que la trasnformación necesaria para la serie es $y_t = \frac{x_t^{\lambda}-1}{\lambda}$.
+
+
+```{r echo=TRUE}
+lambda=forecast::BoxCox.lambda(ts_desempleo, method = "guerrero", lower = -1, upper = 3)
+lambda
+trans_ts_desempleo=((ts_desempleo^lambda)-1)/lambda
+forecast::BoxCox.lambda(trans_ts_desempleo, method = "guerrero", lower = -1, upper = 3)
+```
+
+Al transformar la serie y volver a calcular el lambda de la trasnformación Box-Cox obtenemos un valor de $\lambda=0.9906822$, un valor muy cercano a 1, lo que significa que la varianza se ha estabilizado de manera correcta. Cabe aclarar que entre los valores de lambda no hay mucha diferencia, por lo que se podría pensar que la trasnformación no es tan necesaria, de igual manera en el gráfico que se presenta a continuación, vemos la serie transformada, y podemos notar que no existe mucha diferencia con la gráfica original, a parte de la escala.
+
+```{r echo=TRUE}
+plot(trans_ts_desempleo, ylab = "Serie transformada")
+```
+
+Hemos decidido dejar la trasnformación para seguir la metodología, esperando también que en los modelos que vamos a usar la varianza no cause problemas en la estabilidad del modelo.
+
+# Remover la tendencia
+
+Para remover la tendencia, estudiamos si la serie presenta raíces unitarias. Esto con el fin de determinar si la tendencia se presenta de manera estocástica o determinística. Para ello hacemos uso de los diferentes test de raíces unitarias cuyo resultado presentamos a continuación:
+
+```{r echo=TRUE}
+12*(length(trans_ts_desempleo/100))^(0.25)
+k=trunc((length(trans_ts_desempleo)-1)^(1/3))
+```
+
+
+```{r echo=TRUE}
+ndiffs(trans_ts_desempleo)
+urca::ur.df(trans_ts_desempleo)
+tseries::adf.test(trans_ts_desempleo,k=k)
+fUnitRoots::adfTest(trans_ts_desempleo,lag=k)
+dts_desempleo<-diff(trans_ts_desempleo)
+d_xts_desempleo = as.xts(dts_desempleo)
+```
+
+Al hacer uso de la función ndiffs, obtenemos que la serie presenta una raíz unitaria. En los test se realiza el Test de Dickey-Fuller aumentado y en ambos obtenemos un p-valor mayor que un nivel de significancia del $\alpha=0.05\%$. Por lo que aceptamos la hipótesis nula de que existe una raíz unitaria.
+
+Por tanto asumimos que existe raíz unitaria y la tendencia de la serie es estocástica. Así el método usado para remover la tendencia es diferenciar la serie, es decir $w_t = y_t-y_{t-1}$ donde $w_t$ es la serie resultante.
+
+Podemos ver el gráfico de la serie diferenciada a continuación:
+
+```{r echo=TRUE}
+plot(d_xts_desempleo, main = "Tasa desempleo diferenciada",xlab="Tiempo")
+```
+
+Podemos ver como la serie tiene un aparente comportamiento que fluctúa alrededor de 0, con lo que podríamos pensar que la serie se ha convertido estacionaria, salvo por la componente estacional.
+
+A continuación presentaremos 4 modelos, basados en diferentes metodologías para abordar la estacionalidad. Se realizarán primero dos modelos asumiendo estacionalidad determinística y se modelará por medio de coeficientes de Fourier y variables Dummy, luego presentaremos dos modelos SARIMA en donde se asumirá estacionalidad estocástica. Al final del trabajo presentaremos los resultados y comparaciones entre ellos, así como su ECM, esto con el fin de seleccionar el mejor modelo posible.
+
+# Estacionalidad modelada por coeficientes de Fourier y variables Dummy
+
+Para empezar, vamos a estudiar la estacionalidad por medio de estadística descriptiva. Por lo que acudimos a los gráficos ACF y PACF.
+
+```{r echo=TRUE}
+acf(dts_desempleo, ci.type="ma", lag.max = 50)
+pacf(dts_desempleo, lag.max = 50)
+```
+
+Vemos claramente que en el valor de 1,2,3,.. y valores cercanos a estos tenemos rezagos significativos, lo que nos indica que para la frecuencia de la serie que es 12, esta podría ser el posible período de los ciclos.
+
+Analizamos de manera más profunda por medio de un gráfico de subseries
+
+```{r echo=TRUE}
+tbl_ts_desempleo<- as_tsibble(dts_desempleo)
+tbl_ts_desempleo%>%select(value)%>%gg_season(period = "year")
+tbl_ts_desempleo%>%select(value)%>%gg_subseries(period = "year")
+```
+
+En el primer gráfico vemos como la tasa de desempleo toma sus valores más altos a inicio de cada año, para después aparentemente fluctuar en 0 (En términos de la serie diferenciada) y posteriormente incrementarse al final de cada año. En el segundo, vemos diferencias significativas entre las medias de los meses, siendo más evidente esto en los meses de enero y marzo por ejemplo. Esto demuestra que existe estacionalidad con período igual a 12 meses como habíamos pensado anteriormente,
+
+```{r include=TRUE}
+tbl_desempleo<-as_tibble(tbl_ts_desempleo)
+tbl_desempleo$index<-as.Date(tbl_desempleo$index)
+tbl_desempleo
+```
+
+Continuamos con un gráfico box-plot mensual:
+
+```{r echo=TRUE}
+tbl_desempleo%>%plot_seasonal_diagnostics(.date_var = index,.value = value,.feature_set = c("month.lbl"),.geom="boxplot") 
+```
+
+Vemos algo muy parecido a lo que habíamos visto anteriormente, lo que fortalece nuestra hipótesis de período anual.
+
+Finalizando, realizamos un períodograma:
+
+```{r echo=TRUE}
+spectrum(tbl_desempleo$value,log='no')
+abline(v=1/12, lty=2,col="red")
+abline(v=2/12, lty=2,col="blue")
+abline(v=3/12, lty=2,col=4)
+abline(v=4/12, lty=2,col=7)
+```
+
+Vemos como se producen picos de manera períodica, con la línea roja en el valor $1/12$ que es la frecuencia de la serie, y el valor azul en $1/6$, esto es multiplos racionales de la frecuencia.
+
+Ahora asumiremos que la estacionalidad se presenta de manera estocástica. Continuamos con la metodología, es decir, continuaremos con la serie diferenciada y de ahí partirá nuestro análisis.
+
+
+```{r echo=TRUE}
+nsdiffs(dts_desempleo)
+```
+
+Al realizar el cálculo con la función nsdiffs vemos que es necesario realizar una diferencia estacional.
+
+Realizamos la diferencia estacional para el periodo $s=12$ y estudiamos el ACF y PACF:
+
+```{r echo=TRUE}
+dts_st_desempleo=diff(dts_desempleo,lag=12,differences = 1)
+acf(dts_st_desempleo, ci.type="ma", lag.max = 100)
+pacf(dts_st_desempleo, lag.max = 100)
+```
+
+Como podemos ver en el ACF el rezago en $h=s$ resulta significativo y para múltiplos de s se va para 0. En el PACF vemos que los rezagos en $h=s,h=2s,h=3s$ resultan significativos, así como los rezagos cerca de estos, por tanto $P=3$,$Q=1$ son los parámetros candidatos.
+
+Si analizamos los tres primeros rezagos en el PACF, estos resultan significativos, y en el ACF solo el primero lo es, por tanto $p=3,q=1$ son los parámetros restantes del modelo.
+
+Verificamos si la serie necesita una segunda diferencia estacional.
+
+```{r}
+nsdiffs(dts_st_desempleo)
+```
+
+# Análisis de outlier
+
+Antes de seguir con el modelamiento se debe realizar una revisión a los posibles outliers, para ello se hará un análisis de intervenciones junto con su respectiva variable regresora que medirá y mitigará el impacto de nivel $w_0$ de estos outliers. 
+
+```{r}
+library(tsoutliers)
+tso(ts_desempleo)
+product.outlier<-tso(ts_desempleo,types=c("AO","LS","TC"))
+```
+
+La salida nos muestra que tenemos 2 outliers en las observaciones 25 y 68. Estos son de tipo cambio de nivel y transitorio, respectivamente. Se ajusta una variable regresora para incluirla en el modelo posterior.
+
+```{r}
+plot(product.outlier)
+z=length(ts_desempleo)
+xregresora=rep(0,z)
+xregresora[c(25,68)]=1
+```
+
+
+# Modelamiento
+
+
+Para el modelamiento, empezamos con la siguiente propuesta $SARIMA(3,1,1)_{12}(3,1,1)$.
+
+```{r echo=FALSE}
+modeloalter= Arima(ts_desempleo, c(3, 1, 1),seasonal = list(order = c(3, 1, 1), period = 12),xreg = xregresora,lambda = lambda)
+coeftest(modeloalter)
+
+```
+
+Se ve que los componentes autoregresivos de órdenes 2 y 3 no son significativos, al igual que el componente de promedios móviles, los outliers resultan significativos al $\alpha = 10$%.
+
+Por tanto si borramos estas variables, obtenemos el siguiente modelo $SARIMA(1,1,0)_{12}(3,1,1)$.
+
+```{r}
+modeloalter= Arima(ts_desempleo, c(1, 1,0),seasonal = list(order = c(3, 1, 1), period = 12),lambda = lambda)
+coeftest(modeloalter)
+
+```
+
+En donde sus coeficientes resultan todos significativos, pero al realizar el análisis de residuales obtuvimos una correlación no explicada en los primeros rezagos, esto puede deberse al componente de promedios móviles, por tanto, se decide añadir la componente de promedio móvil.
+
+```{r}
+residuales <- modeloalter$residuals
+plot(residuales)
+acf(residuales,lag.max = 24)
+pacf(residuales,lag.max = 24)
+Box.test(residuales, lag = (length(residuales)/4), type = "Ljung-Box", fitdf = 2)
+######Análisis de Outliers
+#Test de normalidad
+jarque.bera.test(residuales)
+```
+
+Así, obtenemos el modelo final $SARIMA(1,1,1)_{12}(3,1,1)$ en donde todas las componentes resultan significativas también, además se decide dejar los coeficientes de regresión para los outliers.
+
+```{r}
+modeloalter= Arima(ts_desempleo, c(1, 1,1),seasonal = list(order = c(3, 1, 1), period = 12),lambda = lambda, xreg = xregresora,fixed=c(NA,NA,NA,NA,NA,NA,NA))
+coeftest(modeloalter)
+
+```
+
+# Análisis de residuales
+
+En el análisis de residuales vemos que aunque los residuales no tienen un comportamiento normal, no nos quedan rezagos por explicar. Es decir, nuestro modelo logra explicar la estructura de autocorrelación de la serie. Adicionalmente en la prueba de Ljung-Box obtuvimos que no nos queda autocorrelación por explicar.
+
+```{r}
+residuales <- modeloalter$residuals
+plot(residuales)
+acf(residuales,lag.max = 20)
+pacf(residuales,lag.max = 20)
+Box.test(residuales, lag = (length(residuales)/4), type = "Ljung-Box", fitdf = 2)
+######Análisis de Outliers
+#Test de normalidad
+jarque.bera.test(residuales)
+
+```
+
+Las estadísticas CUSUM y CUSUMQS se visualizan estables. Lo cual significa que nuestros parámetros son estables en el tiempo.
+
+```{r echo=TRUE}
+
+###Estad?ticas CUSUM
+res=residuales
+cum=cumsum(res)/sd(res)
+N=length(res)
+cumq=cumsum(res^2)/sum(res^2)
+Af=0.948 ###Cuantil del 95% para la estad?stica cusum
+co=0.14803####Valor del cuantil aproximado para cusumsq para n/2
+LS=Af*sqrt(N)+2*Af*c(1:length(res))/sqrt(N)
+LI=-LS
+LQS=co+(1:length(res))/N
+LQI=-co+(1:length(res))/N
+plot(cum,type="l",ylim=c(min(LI),max(LS)),xlab="t",ylab="",main="CUSUM")
+lines(LS,type="S",col="red")
+lines(LI,type="S",col="red")
+#CUSUM Square
+plot(cumq,type="l",xlab="t",ylab="",main="CUSUMSQ")                      
+lines(LQS,type="S",col="red")                                                                           
+lines(LQI,type="S",col="red")
+```
+
+# Ventana de Rolling
+
+Para la ventana de Rolling Usamos el conjunto completo de datos para reajustar el modelo, por tanto, volvemos a leer los datos.
+
+```{r}
+ts_desempleo<-ts(rev(datos$`Tasa de desempleo (%)`), start = c(2001,01), frequency = 12, end = c(2020,03))
+z=length(ts_desempleo)
+xregresora=rep(0,z)
+xregresora[c(25,68)]=1
+xregresora
+```
+
+Como se había mencionado anteriormente el conjunto de entrenamiento va desde enero del 2001 hasta diciembre del 2018, y el conjunto de prueba va desde enero del 2019 hasta marzo del 2020.
+
+```{r echo=TRUE}
+#####Comparación de pronósticos####
+library(fpp)
+train <- window(ts_desempleo,start=c(2001,01),end=c(2018,12))
+test <- window(ts_desempleo,start=c(2019,01),end=c(2020,03))
+fitmodelo <- Arima(ts_desempleo, c(1, 1,1),seasonal = list(order = c(3, 1, 1), period = 12),lambda = lambda, xreg = xregresora,fixed=c(NA,NA,NA,NA,NA,NA,NA))
+refit <- Arima(ts_desempleo, model=fitmodelo,xreg = xregresora)
+fc <- window(fitted(refit), start=c(2019,01))
+h <- 1
+train <- window(ts_desempleo,start=c(2001,01),end=c(2018,12))
+test <- window(ts_desempleo,start=c(2019,01),end=c(2020,03))
+n <- length(test) - h + 1
+fitmodelo <- Arima(ts_desempleo, c(1, 1,1),seasonal = list(order = c(3, 1, 1), period = 12),lambda = lambda, xreg = xregresora,fixed=c(NA,NA,NA,NA,NA,NA,NA))
+fc <- ts(numeric(n), start=c(2019,01), freq=12)
+for(i in 1:n)
+{  
+  x <- window(ts_desempleo, end=c(2018, 12+(i-1)))
+  z=length(x)
+  xregresora=rep(0,z)
+  xregresora[c(25,68)]=1
+  refit <- Arima(x, model=fitmodelo,xreg = xregresora)
+  fc[i] <- forecast::forecast(refit,xreg = xregresora, h=h)$mean[h]
+}
+dife=(test-fc)^2
+ecm=(1/(length(test)))*sum(dife)
+ecm
+```
+
+Así obtenemos un ECM un paso adelante de 0.261742, lo cuál significa que nuestro modelo es bastante funcional.
+
+# Pronóstico a dos años 
+
+```{r}
+z=length(ts_desempleo)
+xregresora=rep(0,z)
+xregresora[c(25,68)]=1
+modelo_final<-Arima(ts_desempleo, c(1, 1,0),seasonal = list(order = c(3, 1, 1), period = 12),lambda = lambda)
+predicciones<-forecast::forecast(modelo_final,xreg = xregresora, h=24)
+plot(predicciones, main = "Pronóstico a dos años")
+```
+
+Podemos ver como el modelo se ajusta a nuestros datos de excelente manera y aunque no se cumplen estrictamente los supuestos del modelo, esto no presenta un problema mayor para la estimación.
+
